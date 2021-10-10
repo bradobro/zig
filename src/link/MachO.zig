@@ -161,7 +161,7 @@ stub_helper_preamble_atom: ?*Atom = null,
 strtab: std.ArrayListUnmanaged(u8) = .{},
 strtab_dir: std.HashMapUnmanaged(u32, void, StringIndexContext, std.hash_map.default_max_load_percentage) = .{},
 
-got_entries_map: std.AutoArrayHashMapUnmanaged(GotIndirectionKey, *Atom) = .{},
+got_entries_map: std.AutoArrayHashMapUnmanaged(Atom.Relocation.Target, *Atom) = .{},
 stubs_map: std.AutoArrayHashMapUnmanaged(u32, *Atom) = .{},
 
 error_flags: File.ErrorFlags = File.ErrorFlags{},
@@ -232,14 +232,6 @@ const SymbolWithLoc = struct {
     where_index: u32,
     local_sym_index: u32 = 0,
     file: ?u16 = null, // null means Zig module
-};
-
-pub const GotIndirectionKey = struct {
-    where: enum {
-        local,
-        undef,
-    },
-    where_index: u32,
 };
 
 /// When allocating, the ideal_capacity is calculated by
@@ -1866,7 +1858,7 @@ fn writeAtoms(self: *MachO) !void {
     }
 }
 
-pub fn createGotAtom(self: *MachO, key: GotIndirectionKey) !*Atom {
+pub fn createGotAtom(self: *MachO, target: Atom.Relocation.Target) !*Atom {
     const local_sym_index = @intCast(u32, self.locals.items.len);
     try self.locals.append(self.base.allocator, .{
         .n_strx = 0,
@@ -1876,12 +1868,11 @@ pub fn createGotAtom(self: *MachO, key: GotIndirectionKey) !*Atom {
         .n_value = 0,
     });
     const atom = try self.createEmptyAtom(local_sym_index, @sizeOf(u64), 3);
-    switch (key.where) {
+    switch (target) {
         .local => {
             try atom.relocs.append(self.base.allocator, .{
                 .offset = 0,
-                .where = .local,
-                .where_index = key.where_index,
+                .target = target,
                 .payload = .{
                     .unsigned = .{
                         .subtractor = null,
@@ -1892,9 +1883,9 @@ pub fn createGotAtom(self: *MachO, key: GotIndirectionKey) !*Atom {
             });
             try atom.rebases.append(self.base.allocator, 0);
         },
-        .undef => {
+        .global => |n_strx| {
             try atom.bindings.append(self.base.allocator, .{
-                .local_sym_index = key.where_index,
+                .n_strx = n_strx,
                 .offset = 0,
             });
         },
@@ -1958,8 +1949,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             atom.code.items[2] = 0x1d;
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 3,
-                .where = .local,
-                .where_index = dyld_private_sym_index,
+                .target = .{ .local = dyld_private_sym_index },
                 .payload = .{
                     .signed = .{
                         .addend = 0,
@@ -1975,8 +1965,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             atom.code.items[10] = 0x25;
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 11,
-                .where = .undef,
-                .where_index = self.dyld_stub_binder_index.?,
+                .target = .{ .global = self.undefs.items[self.dyld_stub_binder_index.?].n_strx },
                 .payload = .{
                     .load = .{
                         .kind = .got,
@@ -1991,8 +1980,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             mem.writeIntLittle(u32, atom.code.items[0..][0..4], aarch64.Instruction.adrp(.x17, 0).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 0,
-                .where = .local,
-                .where_index = dyld_private_sym_index,
+                .target = .{ .local = dyld_private_sym_index },
                 .payload = .{
                     .page = .{
                         .kind = .page,
@@ -2004,8 +1992,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             mem.writeIntLittle(u32, atom.code.items[4..][0..4], aarch64.Instruction.add(.x17, .x17, 0, false).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 4,
-                .where = .local,
-                .where_index = dyld_private_sym_index,
+                .target = .{ .local = dyld_private_sym_index },
                 .payload = .{
                     .page_off = .{
                         .kind = .page,
@@ -2025,8 +2012,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             mem.writeIntLittle(u32, atom.code.items[12..][0..4], aarch64.Instruction.adrp(.x16, 0).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 12,
-                .where = .undef,
-                .where_index = self.dyld_stub_binder_index.?,
+                .target = .{ .global = self.undefs.items[self.dyld_stub_binder_index.?].n_strx },
                 .payload = .{
                     .page = .{
                         .kind = .got,
@@ -2043,8 +2029,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             }).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 16,
-                .where = .undef,
-                .where_index = self.dyld_stub_binder_index.?,
+                .target = .{ .global = self.undefs.items[self.dyld_stub_binder_index.?].n_strx },
                 .payload = .{
                     .page_off = .{
                         .kind = .got,
@@ -2101,8 +2086,7 @@ pub fn createStubHelperAtom(self: *MachO) !*Atom {
             atom.code.items[5] = 0xe9;
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 6,
-                .where = .local,
-                .where_index = self.stub_helper_preamble_atom.?.local_sym_index,
+                .target = .{ .local = self.stub_helper_preamble_atom.?.local_sym_index },
                 .payload = .{
                     .branch = .{ .arch = arch },
                 },
@@ -2121,8 +2105,7 @@ pub fn createStubHelperAtom(self: *MachO) !*Atom {
             mem.writeIntLittle(u32, atom.code.items[4..8], aarch64.Instruction.b(0).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 4,
-                .where = .local,
-                .where_index = self.stub_helper_preamble_atom.?.local_sym_index,
+                .target = .{ .local = self.stub_helper_preamble_atom.?.local_sym_index },
                 .payload = .{
                     .branch = .{ .arch = arch },
                 },
@@ -2135,7 +2118,7 @@ pub fn createStubHelperAtom(self: *MachO) !*Atom {
     return atom;
 }
 
-pub fn createLazyPointerAtom(self: *MachO, stub_sym_index: u32, lazy_binding_sym_index: u32) !*Atom {
+pub fn createLazyPointerAtom(self: *MachO, stub_sym_index: u32, n_strx: u32) !*Atom {
     const local_sym_index = @intCast(u32, self.locals.items.len);
     try self.locals.append(self.base.allocator, .{
         .n_strx = 0,
@@ -2147,8 +2130,7 @@ pub fn createLazyPointerAtom(self: *MachO, stub_sym_index: u32, lazy_binding_sym
     const atom = try self.createEmptyAtom(local_sym_index, @sizeOf(u64), 3);
     try atom.relocs.append(self.base.allocator, .{
         .offset = 0,
-        .where = .local,
-        .where_index = stub_sym_index,
+        .target = .{ .local = stub_sym_index },
         .payload = .{
             .unsigned = .{
                 .subtractor = null,
@@ -2159,7 +2141,7 @@ pub fn createLazyPointerAtom(self: *MachO, stub_sym_index: u32, lazy_binding_sym
     });
     try atom.rebases.append(self.base.allocator, 0);
     try atom.lazy_bindings.append(self.base.allocator, .{
-        .local_sym_index = lazy_binding_sym_index,
+        .n_strx = n_strx,
         .offset = 0,
     });
     return atom;
@@ -2193,8 +2175,7 @@ pub fn createStubAtom(self: *MachO, laptr_sym_index: u32) !*Atom {
             atom.code.items[1] = 0x25;
             try atom.relocs.append(self.base.allocator, .{
                 .offset = 2,
-                .where = .local,
-                .where_index = laptr_sym_index,
+                .target = .{ .local = laptr_sym_index },
                 .payload = .{
                     .branch = .{ .arch = arch },
                 },
@@ -2206,8 +2187,7 @@ pub fn createStubAtom(self: *MachO, laptr_sym_index: u32) !*Atom {
             mem.writeIntLittle(u32, atom.code.items[0..4], aarch64.Instruction.adrp(.x16, 0).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 0,
-                .where = .local,
-                .where_index = laptr_sym_index,
+                .target = .{ .local = laptr_sym_index },
                 .payload = .{
                     .page = .{
                         .kind = .page,
@@ -2224,8 +2204,7 @@ pub fn createStubAtom(self: *MachO, laptr_sym_index: u32) !*Atom {
             }).toU32());
             atom.relocs.appendAssumeCapacity(.{
                 .offset = 4,
-                .where = .local,
-                .where_index = laptr_sym_index,
+                .target = .{ .local = laptr_sym_index },
                 .payload = .{
                     .page_off = .{
                         .kind = .page,
@@ -2578,7 +2557,7 @@ fn resolveSymbolsInDylibs(self: *MachO) !void {
                     .none => {},
                     .got => return error.TODOGotHint,
                     .stub => {
-                        if (self.stubs_map.contains(resolv.where_index)) break :outer_blk;
+                        if (self.stubs_map.contains(sym.n_strx)) break :outer_blk;
                         const stub_helper_atom = blk: {
                             const match = MatchingSection{
                                 .seg = self.text_segment_cmd_index.?,
@@ -2599,7 +2578,7 @@ fn resolveSymbolsInDylibs(self: *MachO) !void {
                             };
                             const atom = try self.createLazyPointerAtom(
                                 stub_helper_atom.local_sym_index,
-                                resolv.where_index,
+                                sym.n_strx,
                             );
                             const atom_sym = &self.locals.items[atom.local_sym_index];
                             const alignment = try math.powi(u32, 2, atom.alignment);
@@ -2621,7 +2600,7 @@ fn resolveSymbolsInDylibs(self: *MachO) !void {
                             atom_sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
                             break :blk atom;
                         };
-                        try self.stubs_map.putNoClobber(self.base.allocator, resolv.where_index, stub_atom);
+                        try self.stubs_map.putNoClobber(self.base.allocator, sym.n_strx, stub_atom);
                     },
                 }
             }
@@ -2675,12 +2654,9 @@ fn resolveDyldStubBinder(self: *MachO) !void {
     }
 
     // Add dyld_stub_binder as the final GOT entry.
-    const got_entry = GotIndirectionKey{
-        .where = .undef,
-        .where_index = self.dyld_stub_binder_index.?,
-    };
-    const atom = try self.createGotAtom(got_entry);
-    try self.got_entries_map.putNoClobber(self.base.allocator, got_entry, atom);
+    const target = Atom.Relocation.Target{ .global = n_strx };
+    const atom = try self.createGotAtom(target);
+    try self.got_entries_map.putNoClobber(self.base.allocator, target, atom);
     const match = MatchingSection{
         .seg = self.data_const_segment_cmd_index.?,
         .sect = self.got_section_index.?,
@@ -3081,12 +3057,9 @@ pub fn allocateDeclIndexes(self: *MachO, decl: *Module.Decl) !void {
     };
 
     // TODO try popping from free list first before allocating a new GOT atom.
-    const key = GotIndirectionKey{
-        .where = .local,
-        .where_index = decl.link.macho.local_sym_index,
-    };
-    const got_atom = try self.createGotAtom(key);
-    try self.got_entries_map.put(self.base.allocator, key, got_atom);
+    const target = Atom.Relocation.Target{ .local = decl.link.macho.local_sym_index };
+    const got_atom = try self.createGotAtom(target);
+    try self.got_entries_map.put(self.base.allocator, target, got_atom);
 }
 
 pub fn updateFunc(self: *MachO, module: *Module, func: *Module.Fn, air: Air, liveness: Liveness) !void {
@@ -3267,10 +3240,7 @@ fn placeDecl(self: *MachO, decl: *Module.Decl, code_len: usize) !*macho.nlist_64
 
             if (vaddr != symbol.n_value) {
                 log.debug(" (writing new GOT entry)", .{});
-                const got_atom = self.got_entries_map.get(.{
-                    .where = .local,
-                    .where_index = decl.link.macho.local_sym_index,
-                }) orelse unreachable;
+                const got_atom = self.got_entries_map.get(.{ .local = decl.link.macho.local_sym_index }).?;
                 const got_sym = &self.locals.items[got_atom.local_sym_index];
                 const got_vaddr = try self.allocateAtom(got_atom, @sizeOf(u64), 8, .{
                     .seg = self.data_const_segment_cmd_index.?,
@@ -3324,10 +3294,7 @@ fn placeDecl(self: *MachO, decl: *Module.Decl, code_len: usize) !*macho.nlist_64
             .n_desc = 0,
             .n_value = addr,
         };
-        const got_atom = self.got_entries_map.get(.{
-            .where = .local,
-            .where_index = decl.link.macho.local_sym_index,
-        }) orelse unreachable;
+        const got_atom = self.got_entries_map.get(.{ .local = decl.link.macho.local_sym_index }).?;
         const got_sym = &self.locals.items[got_atom.local_sym_index];
         const vaddr = try self.allocateAtom(got_atom, @sizeOf(u64), 8, .{
             .seg = self.data_const_segment_cmd_index.?,
@@ -4357,51 +4324,29 @@ fn allocateAtom(self: *MachO, atom: *Atom, new_atom_size: u64, alignment: u64, m
     return vaddr;
 }
 
-const AddExternFnRes = struct {
-    where: enum {
-        local,
-        undef,
-    },
-    where_index: u32,
-};
-
-pub fn addExternFn(self: *MachO, name: []const u8) !AddExternFnRes {
+pub fn addExternFn(self: *MachO, name: []const u8) !u32 {
     const sym_name = try std.fmt.allocPrint(self.base.allocator, "_{s}", .{name});
     defer self.base.allocator.free(sym_name);
     const n_strx = try self.makeString(sym_name);
 
-    if (self.symbol_resolver.get(n_strx)) |resolv| {
-        return switch (resolv.where) {
-            .global => AddExternFnRes{
-                .where = .local,
-                .where_index = resolv.local_sym_index,
-            },
-            .undef => AddExternFnRes{
-                .where = .undef,
-                .where_index = resolv.where_index,
-            },
-        };
+    if (!self.symbol_resolver.contains(n_strx)) {
+        log.debug("adding new extern function '{s}'", .{sym_name});
+        const sym_index = @intCast(u32, self.undefs.items.len);
+        try self.undefs.append(self.base.allocator, .{
+            .n_strx = n_strx,
+            .n_type = macho.N_UNDF,
+            .n_sect = 0,
+            .n_desc = 0,
+            .n_value = 0,
+        });
+        try self.symbol_resolver.putNoClobber(self.base.allocator, n_strx, .{
+            .where = .undef,
+            .where_index = sym_index,
+        });
+        try self.unresolved.putNoClobber(self.base.allocator, sym_index, .stub);
     }
 
-    log.debug("adding new extern function '{s}'", .{sym_name});
-    const sym_index = @intCast(u32, self.undefs.items.len);
-    try self.undefs.append(self.base.allocator, .{
-        .n_strx = n_strx,
-        .n_type = macho.N_UNDF,
-        .n_sect = 0,
-        .n_desc = 0,
-        .n_value = 0,
-    });
-    try self.symbol_resolver.putNoClobber(self.base.allocator, n_strx, .{
-        .where = .undef,
-        .where_index = sym_index,
-    });
-    try self.unresolved.putNoClobber(self.base.allocator, sym_index, .stub);
-
-    return AddExternFnRes{
-        .where = .undef,
-        .where_index = sym_index,
-    };
+    return n_strx;
 }
 
 const NextSegmentAddressAndOffset = struct {
@@ -4496,23 +4441,47 @@ fn writeDyldInfoData(self: *MachO) !void {
                 }
 
                 for (atom.bindings.items) |binding| {
-                    const bind_sym = self.undefs.items[binding.local_sym_index];
-                    try bind_pointers.append(.{
-                        .offset = binding.offset + base_offset,
-                        .segment_id = match.seg,
-                        .dylib_ordinal = @divExact(bind_sym.n_desc, macho.N_SYMBOL_RESOLVER),
-                        .name = self.getString(bind_sym.n_strx),
-                    });
+                    const resolv = self.symbol_resolver.get(binding.n_strx).?;
+                    switch (resolv.where) {
+                        .global => {
+                            // Turn into a rebase.
+                            try rebase_pointers.append(.{
+                                .offset = base_offset + binding.offset,
+                                .segment_id = match.seg,
+                            });
+                        },
+                        .undef => {
+                            const bind_sym = self.undefs.items[resolv.where_index];
+                            try bind_pointers.append(.{
+                                .offset = binding.offset + base_offset,
+                                .segment_id = match.seg,
+                                .dylib_ordinal = @divExact(bind_sym.n_desc, macho.N_SYMBOL_RESOLVER),
+                                .name = self.getString(bind_sym.n_strx),
+                            });
+                        },
+                    }
                 }
 
                 for (atom.lazy_bindings.items) |binding| {
-                    const bind_sym = self.undefs.items[binding.local_sym_index];
-                    try lazy_bind_pointers.append(.{
-                        .offset = binding.offset + base_offset,
-                        .segment_id = match.seg,
-                        .dylib_ordinal = @divExact(bind_sym.n_desc, macho.N_SYMBOL_RESOLVER),
-                        .name = self.getString(bind_sym.n_strx),
-                    });
+                    const resolv = self.symbol_resolver.get(binding.n_strx).?;
+                    switch (resolv.where) {
+                        .global => {
+                            // Turn into a rebase.
+                            try rebase_pointers.append(.{
+                                .offset = base_offset + binding.offset,
+                                .segment_id = match.seg,
+                            });
+                        },
+                        .undef => {
+                            const bind_sym = self.undefs.items[resolv.where_index];
+                            try lazy_bind_pointers.append(.{
+                                .offset = binding.offset + base_offset,
+                                .segment_id = match.seg,
+                                .dylib_ordinal = @divExact(bind_sym.n_desc, macho.N_SYMBOL_RESOLVER),
+                                .name = self.getString(bind_sym.n_strx),
+                            });
+                        },
+                    }
                 }
 
                 if (atom.prev) |prev| {
@@ -4875,24 +4844,34 @@ fn writeSymbolTable(self: *MachO) !void {
 
     stubs.reserved1 = 0;
     for (self.stubs_map.keys()) |key| {
-        try writer.writeIntLittle(u32, dysymtab.iundefsym + key);
+        const resolv = self.symbol_resolver.get(key).?;
+        switch (resolv.where) {
+            .global => try writer.writeIntLittle(u32, macho.INDIRECT_SYMBOL_LOCAL),
+            .undef => try writer.writeIntLittle(u32, dysymtab.iundefsym + resolv.where_index),
+        }
     }
 
     got.reserved1 = nstubs;
     for (self.got_entries_map.keys()) |key| {
-        switch (key.where) {
-            .undef => {
-                try writer.writeIntLittle(u32, dysymtab.iundefsym + key.where_index);
-            },
-            .local => {
-                try writer.writeIntLittle(u32, macho.INDIRECT_SYMBOL_LOCAL);
+        switch (key) {
+            .local => try writer.writeIntLittle(u32, macho.INDIRECT_SYMBOL_LOCAL),
+            .global => |n_strx| {
+                const resolv = self.symbol_resolver.get(n_strx).?;
+                switch (resolv.where) {
+                    .global => try writer.writeIntLittle(u32, macho.INDIRECT_SYMBOL_LOCAL),
+                    .undef => try writer.writeIntLittle(u32, dysymtab.iundefsym + resolv.where_index),
+                }
             },
         }
     }
 
     la_symbol_ptr.reserved1 = got.reserved1 + ngot_entries;
     for (self.stubs_map.keys()) |key| {
-        try writer.writeIntLittle(u32, dysymtab.iundefsym + key);
+        const resolv = self.symbol_resolver.get(key).?;
+        switch (resolv.where) {
+            .global => try writer.writeIntLittle(u32, macho.INDIRECT_SYMBOL_LOCAL),
+            .undef => try writer.writeIntLittle(u32, dysymtab.iundefsym + resolv.where_index),
+        }
     }
 
     try self.base.file.?.pwriteAll(buf, dysymtab.indirectsymoff);

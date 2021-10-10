@@ -54,10 +54,10 @@ rebases: std.ArrayListUnmanaged(u64) = .{},
 /// List of offsets contained within this atom that will be dynamically bound
 /// by the dynamic loader and contain pointers to resolved (at load time) extern
 /// symbols (aka proxies aka imports)
-bindings: std.ArrayListUnmanaged(SymbolAtOffset) = .{},
+bindings: std.ArrayListUnmanaged(Binding) = .{},
 
 /// List of lazy bindings
-lazy_bindings: std.ArrayListUnmanaged(SymbolAtOffset) = .{},
+lazy_bindings: std.ArrayListUnmanaged(Binding) = .{},
 
 /// List of data-in-code entries. This is currently specific to x86_64 only.
 dices: std.ArrayListUnmanaged(macho.data_in_code_entry) = .{},
@@ -82,6 +82,22 @@ dbg_info_off: u32,
 dbg_info_len: u32,
 
 dirty: bool = true,
+
+pub const Binding = struct {
+    n_strx: u32,
+    offset: u64,
+
+    pub fn format(
+        self: Binding,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
+        try std.fmt.format(writer, "{{ .n_strx = {d}, .offset = {d} }}", .{ self.n_strx, self.offset });
+    }
+};
 
 pub const SymbolAtOffset = struct {
     local_sym_index: u32,
@@ -171,16 +187,16 @@ pub const Stab = union(enum) {
 };
 
 pub const Relocation = struct {
+    pub const Target = union(enum) {
+        local: u32,
+        global: u32,
+    };
+
     /// Offset within the atom's code buffer.
     /// Note relocation size can be inferred by relocation's kind.
     offset: u32,
 
-    where: enum {
-        local,
-        undef,
-    },
-
-    where_index: u32,
+    target: Target,
 
     payload: union(enum) {
         unsigned: Unsigned,
@@ -561,8 +577,7 @@ pub const Relocation = struct {
     pub fn format(self: Relocation, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
         try std.fmt.format(writer, "Relocation {{ ", .{});
         try std.fmt.format(writer, ".offset = {}, ", .{self.offset});
-        try std.fmt.format(writer, ".where = {}, ", .{self.where});
-        try std.fmt.format(writer, ".where_index = {d}, ", .{self.where_index});
+        try std.fmt.format(writer, ".target = {}, ", .{self.target});
 
         switch (self.payload) {
             .unsigned => |unsigned| try unsigned.format(fmt, options, writer),
@@ -650,8 +665,7 @@ const RelocContext = struct {
 fn initRelocFromObject(rel: macho.relocation_info, context: RelocContext) !Relocation {
     var parsed_rel = Relocation{
         .offset = @intCast(u32, @intCast(u64, rel.r_address) - context.base_offset),
-        .where = undefined,
-        .where_index = undefined,
+        .target = undefined,
         .payload = undefined,
     };
 
@@ -674,31 +688,19 @@ fn initRelocFromObject(rel: macho.relocation_info, context: RelocContext) !Reloc
             break :blk local_sym_index;
         };
 
-        parsed_rel.where = .local;
-        parsed_rel.where_index = local_sym_index;
+        parsed_rel.target = .{ .local = local_sym_index };
     } else {
         const sym = context.object.symtab.items[rel.r_symbolnum];
         const sym_name = context.object.getString(sym.n_strx);
 
         if (MachO.symbolIsSect(sym) and !MachO.symbolIsExt(sym)) {
-            const where_index = context.object.symbol_mapping.get(rel.r_symbolnum) orelse unreachable;
-            parsed_rel.where = .local;
-            parsed_rel.where_index = where_index;
+            const sym_index = context.object.symbol_mapping.get(rel.r_symbolnum) orelse unreachable;
+            parsed_rel.target = .{ .local = sym_index };
         } else {
             const n_strx = context.macho_file.strtab_dir.getKeyAdapted(@as([]const u8, sym_name), StringIndexAdapter{
                 .bytes = &context.macho_file.strtab,
             }) orelse unreachable;
-            const resolv = context.macho_file.symbol_resolver.get(n_strx) orelse unreachable;
-            switch (resolv.where) {
-                .global => {
-                    parsed_rel.where = .local;
-                    parsed_rel.where_index = resolv.local_sym_index;
-                },
-                .undef => {
-                    parsed_rel.where = .undef;
-                    parsed_rel.where_index = resolv.where_index;
-                },
-            }
+            parsed_rel.target = .{ .global = n_strx };
         }
     }
 
@@ -853,17 +855,14 @@ pub fn parseRelocs(self: *Atom, relocs: []macho.relocation_info, context: RelocC
         };
 
         if (is_via_got) blk: {
-            const key = MachO.GotIndirectionKey{
-                .where = switch (parsed_rel.where) {
-                    .local => .local,
-                    .undef => .undef,
-                },
-                .where_index = parsed_rel.where_index,
-            };
-            if (context.macho_file.got_entries_map.contains(key)) break :blk;
+            if (context.macho_file.got_entries_map.contains(parsed_rel.target)) break :blk;
 
-            const atom = try context.macho_file.createGotAtom(key);
-            try context.macho_file.got_entries_map.putNoClobber(context.macho_file.base.allocator, key, atom);
+            const atom = try context.macho_file.createGotAtom(parsed_rel.target);
+            try context.macho_file.got_entries_map.putNoClobber(
+                context.macho_file.base.allocator,
+                parsed_rel.target,
+                atom,
+            );
             const match = MachO.MatchingSection{
                 .seg = context.macho_file.data_const_segment_cmd_index.?,
                 .sect = context.macho_file.got_section_index.?,
@@ -881,10 +880,10 @@ pub fn parseRelocs(self: *Atom, relocs: []macho.relocation_info, context: RelocC
                 try context.object.end_atoms.putNoClobber(context.allocator, match, atom);
             }
         } else if (parsed_rel.payload == .unsigned) {
-            switch (parsed_rel.where) {
-                .undef => {
+            switch (parsed_rel.target) {
+                .global => |n_strx| {
                     try self.bindings.append(context.allocator, .{
-                        .local_sym_index = parsed_rel.where_index,
+                        .n_strx = n_strx,
                         .offset = parsed_rel.offset,
                     });
                 },
@@ -932,8 +931,8 @@ pub fn parseRelocs(self: *Atom, relocs: []macho.relocation_info, context: RelocC
                 },
             }
         } else if (parsed_rel.payload == .branch) blk: {
-            if (parsed_rel.where != .undef) break :blk;
-            if (context.macho_file.stubs_map.contains(parsed_rel.where_index)) break :blk;
+            if (parsed_rel.target != .global) break :blk;
+            if (context.macho_file.stubs_map.contains(parsed_rel.target.global)) break :blk;
 
             // TODO clean this up!
             const stub_helper_atom = atom: {
@@ -957,7 +956,7 @@ pub fn parseRelocs(self: *Atom, relocs: []macho.relocation_info, context: RelocC
             const laptr_atom = atom: {
                 const atom = try context.macho_file.createLazyPointerAtom(
                     stub_helper_atom.local_sym_index,
-                    parsed_rel.where_index,
+                    parsed_rel.target.global,
                 );
                 const match = MachO.MatchingSection{
                     .seg = context.macho_file.data_segment_cmd_index.?,
@@ -991,7 +990,7 @@ pub fn parseRelocs(self: *Atom, relocs: []macho.relocation_info, context: RelocC
                 } else {
                     try context.object.end_atoms.putNoClobber(context.allocator, match, atom);
                 }
-                try context.macho_file.stubs_map.putNoClobber(context.allocator, parsed_rel.where_index, atom);
+                try context.macho_file.stubs_map.putNoClobber(context.allocator, parsed_rel.target.global, atom);
             }
         }
     }
@@ -1184,27 +1183,21 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
             };
 
             if (is_via_got) {
-                const atom = macho_file.got_entries_map.get(.{
-                    .where = switch (rel.where) {
-                        .local => .local,
-                        .undef => .undef,
-                    },
-                    .where_index = rel.where_index,
-                }) orelse {
-                    const sym = switch (rel.where) {
-                        .local => macho_file.locals.items[rel.where_index],
-                        .undef => macho_file.undefs.items[rel.where_index],
+                const atom = macho_file.got_entries_map.get(rel.target) orelse {
+                    const n_strx = switch (rel.target) {
+                        .local => |sym_index| macho_file.locals.items[sym_index].n_strx,
+                        .global => |n_strx| n_strx,
                     };
-                    log.err("expected GOT entry for symbol '{s}'", .{macho_file.getString(sym.n_strx)});
+                    log.err("expected GOT entry for symbol '{s}'", .{macho_file.getString(n_strx)});
                     log.err("  this is an internal linker error", .{});
                     return error.FailedToResolveRelocationTarget;
                 };
                 break :blk macho_file.locals.items[atom.local_sym_index].n_value;
             }
 
-            switch (rel.where) {
-                .local => {
-                    const sym = macho_file.locals.items[rel.where_index];
+            switch (rel.target) {
+                .local => |sym_index| {
+                    const sym = macho_file.locals.items[sym_index];
                     const is_tlv = is_tlv: {
                         const source_sym = macho_file.locals.items[self.local_sym_index];
                         const match = macho_file.section_ordinals.keys()[source_sym.n_sect - 1];
@@ -1236,19 +1229,19 @@ pub fn resolveRelocs(self: *Atom, macho_file: *MachO) !void {
 
                     break :blk sym.n_value;
                 },
-                .undef => {
-                    const atom = macho_file.stubs_map.get(rel.where_index) orelse {
+                .global => |n_strx| {
+                    const atom = macho_file.stubs_map.get(n_strx) orelse {
                         // TODO this is required for incremental when we don't have every symbol
                         // resolved when creating relocations. In this case, we will insert a branch
                         // reloc to an undef symbol which may happen to be defined within the binary.
                         // Then, the undef we point at will be a null symbol (free symbol) which we
                         // should remove/repurpose. To circumvent this (for now), we check if the symbol
                         // we point to is garbage, and if so we fall back to symbol resolver to find by name.
-                        const n_strx = macho_file.undefs.items[rel.where_index].n_strx;
-                        if (macho_file.symbol_resolver.get(n_strx)) |resolv| inner: {
-                            if (resolv.where != .global) break :inner;
-                            break :blk macho_file.globals.items[resolv.where_index].n_value;
-                        }
+                        // const n_strx = macho_file.undefs.items[rel.where_index].n_strx;
+                        // if (macho_file.symbol_resolver.get(n_strx)) |resolv| inner: {
+                        //     if (resolv.where != .global) break :inner;
+                        //     break :blk macho_file.globals.items[resolv.where_index].n_value;
+                        // }
 
                         // TODO verify in TextBlock that the symbol is indeed dynamically bound.
                         break :blk 0; // Dynamically bound by dyld.

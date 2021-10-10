@@ -3002,7 +3002,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                         }
                     } else if (func_value.castTag(.extern_fn)) |func_payload| {
                         const decl = func_payload.data;
-                        const resolv = try macho_file.addExternFn(mem.spanZ(decl.name));
+                        const n_strx = try macho_file.addExternFn(mem.spanZ(decl.name));
                         const offset = blk: {
                             switch (arch) {
                                 .x86_64 => {
@@ -3023,11 +3023,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                         // Add relocation to the decl.
                         try macho_file.active_decl.?.link.macho.relocs.append(self.bin_file.allocator, .{
                             .offset = offset,
-                            .where = switch (resolv.where) {
-                                .local => .local,
-                                .undef => .undef,
-                            },
-                            .where_index = resolv.where_index,
+                            .target = .{ .global = n_strx },
                             .payload = .{ .branch = .{
                                 .arch = arch,
                             } },
@@ -4516,15 +4512,13 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                                 // Page reloc for adrp instruction.
                                 try decl.link.macho.relocs.append(self.bin_file.allocator, .{
                                     .offset = offset,
-                                    .where = .local,
-                                    .where_index = @intCast(u32, addr),
+                                    .target = .{ .local = @intCast(u32, addr) },
                                     .payload = .{ .page = .{ .kind = .got } },
                                 });
                                 // Pageoff reloc for adrp instruction.
                                 try decl.link.macho.relocs.append(self.bin_file.allocator, .{
                                     .offset = offset + 4,
-                                    .where = .local,
-                                    .where_index = @intCast(u32, addr),
+                                    .target = .{ .local = @intCast(u32, addr) },
                                     .payload = .{ .page_off = .{ .kind = .got } },
                                 });
                             } else {
@@ -4790,8 +4784,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                                 // Load reloc for LEA instruction.
                                 try decl.link.macho.relocs.append(self.bin_file.allocator, .{
                                     .offset = offset - 4,
-                                    .where = .local,
-                                    .where_index = @intCast(u32, x),
+                                    .target = .{ .local = @intCast(u32, x) },
                                     .payload = .{ .load = .{ .kind = .got } },
                                 });
                             } else {
